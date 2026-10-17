@@ -25,6 +25,9 @@ Kumpulan skrip otomatisasi proxy farm, pendaftaran akun otomatis, solver captcha
 ```bash
 # Panen 10 akun ProxyScrape secara paralel tanpa domain:
 python3 proxyscrape_harvester.py --count 10 --workers 2 --consumers 3
+
+# Mode Self-Feed (Otomatis menggunakan proxy hasil panen sebelumnya untuk rotasi akun selanjutnya):
+python3 proxyscrape_harvester.py --count 50 --workers 2 --consumers 3 --feed-self
 ```
 Hasil proxy akan otomatis tersimpan di `output/proxies_http.txt` dalam format:
 ```text

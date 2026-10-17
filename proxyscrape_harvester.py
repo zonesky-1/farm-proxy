@@ -60,6 +60,21 @@ TELEGRAM_THREAD_ID = os.getenv("TELEGRAM_THREAD_ID", "")
 
 file_lock = threading.Lock()
 tg_lock = threading.Lock()
+pool_lock = threading.Lock()
+
+def get_live_proxy_from_pool():
+    """Mengambil 1 proxy acak dari output/proxies_http.txt yang sudah terpanen."""
+    with pool_lock:
+        if not os.path.exists(PROXIES_FILE):
+            return None
+        try:
+            with open(PROXIES_FILE, "r", encoding="utf-8") as f:
+                lines = [l.strip() for l in f if l.strip() and ":" in l]
+            if lines:
+                return secrets.choice(lines)
+        except Exception:
+            pass
+        return None
 
 def log(msg):
     ts = time.strftime("[%Y-%m-%d %H:%M:%S]")
@@ -171,7 +186,7 @@ class TempMailEngine:
 
 # ── PRODUCER: REGISTRASI & TURNSTILE SOLVER ────────────────────────────
 
-async def registration_producer(wid, otp_queue, stop_event, proxy_server=None):
+async def registration_producer(wid, otp_queue, stop_event, proxy_server=None, feed_self=False):
     """Worker pembuka browser stealth untuk bypass Turnstile dan mendaftarkan akun."""
     ensure_xvfb()
 
@@ -179,6 +194,14 @@ async def registration_producer(wid, otp_queue, stop_event, proxy_server=None):
         inbox = TempMailEngine()
         email = inbox.email
         password = gen_password()
+
+        # Tentukan proxy yang dipakai untuk sesi ini
+        current_proxy = proxy_server
+        if feed_self:
+            harvested = get_live_proxy_from_pool()
+            if harvested:
+                current_proxy = harvested
+                log(f"[W{wid}] 🔄 [Self-Feed] Menggunakan proxy hasil panen sebelumnya: {current_proxy}")
 
         log(f"[W{wid}] [1/5] Memulai registrasi untuk `{email}`...")
 
@@ -188,8 +211,8 @@ async def registration_producer(wid, otp_queue, stop_event, proxy_server=None):
             async with async_playwright() as p:
                 launch_args = ["--disable-blink-features=AutomationControlled"]
                 kw = {"headless": False, "args": launch_args}
-                if proxy_server:
-                    kw["proxy"] = {"server": proxy_server}
+                if current_proxy:
+                    kw["proxy"] = {"server": current_proxy}
 
                 browser = await p.chromium.launch(**kw)
                 ctx = await browser.new_context(
@@ -265,6 +288,10 @@ async def registration_producer(wid, otp_queue, stop_event, proxy_server=None):
             "Referer": f"{TARGET_BASE}/v2/sign-up"
         }
 
+        req_proxies = None
+        if current_proxy:
+            req_proxies = {"http": current_proxy, "https": current_proxy}
+
         def call_register():
             try:
                 # Coba endpoint dashboard v2 dan v4
@@ -273,6 +300,7 @@ async def registration_producer(wid, otp_queue, stop_event, proxy_server=None):
                     data={"email": email, "password": password, "cf_turnstile_token": token},
                     headers=headers,
                     cookies=cookies,
+                    proxies=req_proxies,
                     timeout=15
                 )
                 if r.status_code == 200 and r.json().get("access_token"):
@@ -284,6 +312,7 @@ async def registration_producer(wid, otp_queue, stop_event, proxy_server=None):
                     data={"email": email, "password": password, "cf_turnstile_token": token},
                     headers=headers,
                     cookies=cookies,
+                    proxies=req_proxies,
                     timeout=15
                 )
                 return r2.json()
@@ -306,7 +335,7 @@ async def registration_producer(wid, otp_queue, stop_event, proxy_server=None):
         # Trigger reset/resend verification code
         def trigger_resend():
             try:
-                requests.post(f"{API_BASE}/account/reset-verification-code", headers=auth_headers, timeout=10)
+                requests.post(f"{API_BASE}/account/reset-verification-code", headers=auth_headers, proxies=req_proxies, timeout=10)
             except Exception:
                 pass
 
@@ -317,7 +346,8 @@ async def registration_producer(wid, otp_queue, stop_event, proxy_server=None):
             "password": password,
             "access_token": access_token,
             "auth_headers": auth_headers,
-            "inbox": inbox
+            "inbox": inbox,
+            "proxy": current_proxy
         }
         await otp_queue.put(item)
         log(f"[W{wid}] [1/5] Sukses Register {email} -> masuk antrean OTP")
@@ -338,6 +368,11 @@ async def otp_consumer(cid, otp_queue, stop_event, target_count, state, notify_e
         access_token = item["access_token"]
         auth_headers = item["auth_headers"]
         inbox = item["inbox"]
+        current_proxy = item.get("proxy")
+
+        req_proxies = None
+        if current_proxy:
+            req_proxies = {"http": current_proxy, "https": current_proxy}
 
         log(f"[C{cid}] [2/5] Menunggu OTP untuk `{email}`...")
         otp = await asyncio.to_thread(inbox.poll_otp, 120)
@@ -355,6 +390,7 @@ async def otp_consumer(cid, otp_queue, stop_event, target_count, state, notify_e
                     f"{API_BASE}/account/verify-email",
                     json={"verificationCode": otp},
                     headers=auth_headers,
+                    proxies=req_proxies,
                     timeout=10
                 )
             except Exception:
@@ -362,14 +398,14 @@ async def otp_consumer(cid, otp_queue, stop_event, target_count, state, notify_e
 
             account_id = None
             try:
-                claim_res = requests.post(f"{API_BASE}/account/premium/claim-trial", headers=auth_headers, timeout=10).json()
+                claim_res = requests.post(f"{API_BASE}/account/premium/claim-trial", headers=auth_headers, proxies=req_proxies, timeout=10).json()
                 account_id = claim_res.get("account_id")
             except Exception:
                 pass
 
             if not account_id:
                 try:
-                    me_res = requests.post(f"{API_BASE}/account/auth/me", headers=auth_headers, timeout=10).json()
+                    me_res = requests.post(f"{API_BASE}/account/auth/me", headers=auth_headers, proxies=req_proxies, timeout=10).json()
                     subs = me_res.get("associatedSubaccounts", [])
                     if subs:
                         account_id = subs[0].get("AccountID")
@@ -382,7 +418,7 @@ async def otp_consumer(cid, otp_queue, stop_event, target_count, state, notify_e
             proxy_user = ""
             proxy_pass = ""
             try:
-                ov_res = requests.get(f"{API_BASE}/account/{account_id}/datacenter_shared/overview", headers=auth_headers, timeout=10).json()
+                ov_res = requests.get(f"{API_BASE}/account/{account_id}/datacenter_shared/overview", headers=auth_headers, proxies=req_proxies, timeout=10).json()
                 ds = ov_res.get("data", {}).get("services", {}).get("datacenter_shared", {})
                 proxy_user = ds.get("proxy_username", "")
                 proxy_pass = ds.get("proxy_password", "")
@@ -394,6 +430,7 @@ async def otp_consumer(cid, otp_queue, stop_event, target_count, state, notify_e
                 pl_res = requests.get(
                     f"{API_BASE}/account/{account_id}/datacenter_shared/proxy-list?type=getproxies&proxyformat=userpass&protocol=http",
                     headers=auth_headers,
+                    proxies=req_proxies,
                     timeout=12
                 )
                 if proxy_user and proxy_pass:
@@ -467,7 +504,8 @@ async def main():
     parser.add_argument("--workers", type=int, default=2, help="Jumlah worker browser registrasi paralel")
     parser.add_argument("--consumers", type=int, default=3, help="Jumlah consumer verifikasi OTP paralel")
     parser.add_argument("--notify-every", type=int, default=1, help="Kirim notifikasi Telegram tiap N akun")
-    parser.add_argument("--proxy", type=str, default=None, help="Proxy opsional untuk browser")
+    parser.add_argument("--proxy", type=str, default=None, help="Proxy awal opsional untuk browser")
+    parser.add_argument("--feed-self", action="store_true", help="Gunakan proxy hasil panen sebelumnya secara otomatis untuk rotasi akun berikutnya")
 
     args = parser.parse_args()
 
@@ -475,6 +513,7 @@ async def main():
 
     log(f"[*] ProxyScrape Harvester Siap!")
     log(f"[*] Target: {args.count or 'Unlimited'} akun | Workers: {args.workers} | Consumers: {args.consumers}")
+    log(f"[*] Mode Self-Feed: {'Aktif (Auto-Rotation)' if args.feed_self else 'Nonaktif'}")
     log(f"[*] Output: {PROXIES_FILE}")
 
     state = {"completed": 0}
@@ -482,7 +521,7 @@ async def main():
     otp_queue = asyncio.Queue(maxsize=100)
 
     producers = [
-        asyncio.create_task(registration_producer(i + 1, otp_queue, stop_event, args.proxy))
+        asyncio.create_task(registration_producer(i + 1, otp_queue, stop_event, args.proxy, args.feed_self))
         for i in range(args.workers)
     ]
     consumers = [
